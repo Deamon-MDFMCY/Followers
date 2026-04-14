@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>City Command Center</title>
+    <style>
+        body { margin: 0; background-color: #1a1c23; color: white; font-family: sans-serif; display: flex; height: 100vh; overflow: hidden;}
+
+        .panel {
+            background: #2a2d35; padding: 20px; border-right: 1px solid #4a4d54;
+            width: 340px; flex-shrink: 0; overflow-y: auto; z-index: 10; box-shadow: 4px 0 15px rgba(0,0,0,0.5);
+        }
+
+        #minimap-container { flex-grow: 1; position: relative; background: #0f1115; cursor: grab; }
+        #minimap-container.building { cursor: crosshair; }
+        #minimap-container:active { cursor: grabbing; }
+        #minimap-container.building:active { cursor: crosshair; }
+
+        #minimap { width: 100%; height: 100%; display: block; }
+        #map-legend { position: absolute; bottom: 20px; right: 20px; background: rgba(0,0,0,0.8); padding: 15px; border-radius: 6px; font-size: 12px; border: 1px solid #333; pointer-events: none; display: flex; gap: 20px;}
+        .legend-col { display: flex; flex-direction: column; gap: 8px; }
+        .legend-item { display: flex; align-items: center; }
+        .legend-color { width: 14px; height: 14px; margin-right: 8px; border-radius: 2px;}
+
+        .section { margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid #4a4d54; }
+        .section:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+        h3 { margin: 0 0 10px 0; font-size: 16px; color: #ffaa33; }
+        .row { margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; gap: 10px;}
+
+        button, input, select { padding: 8px 12px; border-radius: 4px; border: none; font-weight: bold; font-size: 13px;}
+        button { cursor: pointer; transition: 0.2s; width: 100%; margin-bottom: 8px; box-sizing: border-box;}
+        .btn-primary { background: #9146FF; color: white; }
+        .btn-primary:hover { background: #772ce8; }
+        .btn-secondary { background: #4a4d54; color: white; }
+        .btn-secondary:hover { background: #5b5f68; }
+        .btn-danger { background: #5a2424; color: #ffd4d4; }
+        .btn-danger:hover { background: #7a3030; }
+        .btn-success { background: #1d6b3a; color: white; }
+        .btn-success:hover { background: #258449; }
+
+        .tool-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .tool-btn { background: #3b3d42; color: white; border: 1px solid #555; margin: 0; }
+        .tool-btn.active { background: #ffaa33; color: black; border-color: #ffaa33; }
+
+        input[type="text"], input[type="number"] { flex-grow: 1; text-align: center; background: #111; color: white; border: 1px solid #555; min-width: 0;}
+        input[type="checkbox"] { width: 16px; height: 16px; accent-color: #9146FF;}
+        select { background:#111; color:white; border:1px solid #555; flex-grow:1; }
+
+        #stats { color: #00ffcc; text-align: center; font-weight: bold; margin-top: 10px; font-size: 14px; background: #111; padding: 10px; border-radius: 4px;}
+
+        .twitch-status { font-size: 12px; padding: 6px 10px; border-radius: 4px; margin-bottom: 8px; text-align: center; }
+        .twitch-status.disconnected { background: #3a2424; color: #ff8888; }
+        .twitch-status.connecting { background: #3a3624; color: #ffdd66; }
+        .twitch-status.connected { background: #1d4d2a; color: #88ff99; }
+
+        .help-text { font-size: 11px; color:#aaa; margin: 4px 0 8px 0; line-height: 1.4; }
+        .help-text code { background: #111; padding: 1px 5px; border-radius: 3px; color: #ffaa33; font-family: monospace;}
+
+        #toast-container {
+            position: absolute; top: 20px; left: 50%; transform: translateX(-50%);
+            z-index: 200; pointer-events: none; display: flex; flex-direction: column; gap: 8px; align-items: center;
+        }
+        .toast {
+            background: rgba(0,0,0,0.92); color: white; padding: 10px 18px; border-radius: 6px;
+            font-size: 14px; font-weight: bold; box-shadow: 0 4px 12px rgba(0,0,0,0.6);
+            border-left: 4px solid #9146FF; animation: toastIn 0.25s ease-out; pointer-events: auto;
+            max-width: 480px;
+        }
+        .toast.warn { border-left-color: #ffaa33; }
+        .toast.error { border-left-color: #ff4444; }
+        .toast.event { border-left-color: #00ffcc; }
+        .toast.fading { opacity: 0; transition: opacity 0.4s; }
+        @keyframes toastIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
+
+        details { background: #1f2128; border-radius: 4px; padding: 8px 10px; margin-bottom: 8px; }
+        details summary { cursor: pointer; font-weight: bold; font-size: 13px; color: #ccc; }
+        details[open] summary { margin-bottom: 8px; }
+    </style>
+</head>
+<body>
+
+<div class="panel">
+    <div class="section">
+        <h3>Twitch Integration</h3>
+        <div id="twitch-status" class="twitch-status disconnected">Disconnected</div>
+        <details id="twitch-config">
+            <summary>Setup (one-time)</summary>
+            <p class="help-text">
+                1. Go to <code>dev.twitch.tv/console/apps</code> and register a new application.<br>
+                2. Set <b>OAuth Redirect URL</b> to exactly: <code id="redirect-uri-display">…</code><br>
+                3. Category: <code>Application Integration</code>, Client Type: <code>Public</code>.<br>
+                4. Copy the Client ID and paste below.
+            </p>
+            <div class="row">
+                <input type="text" id="twitch-client-id" placeholder="Twitch Client ID">
+            </div>
+        </details>
+        <button class="btn-primary" id="twitch-connect-btn" onclick="twitchConnect()">Connect to Twitch</button>
+        <button class="btn-secondary" id="twitch-disconnect-btn" onclick="twitchDisconnect()" style="display:none;">Disconnect</button>
+        <button class="btn-secondary" onclick="twitchTestEvent()">🧪 Fire Test Follow</button>
+    </div>
+
+    <div class="section">
+        <h3>Camera & View</h3>
+        <button class="btn-secondary" onclick="sendCmd('TOGGLE_ROTATION')">Toggle Auto-Rotation</button>
+        <button class="btn-secondary" onclick="sendCmd('TOGGLE_VIEW')">Switch 2D/3D View</button>
+        <div class="row" style="margin-top:10px;">
+            <label>Theme:</label>
+            <select id="theme-select" onchange="setTheme()">
+                <option value="nocturne">Nocturne</option>
+                <option value="synthwave">Synthwave</option>
+                <option value="verdant">Verdant</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="section">
+        <h3>Simulation Engine</h3>
+        <div class="row">
+            <input type="text" id="search-input" placeholder="Search name (#42)..." onkeydown="if(event.key==='Enter')search()">
+            <button class="btn-primary" onclick="search()" style="width:auto; margin:0;">Find</button>
+        </div>
+        <div class="row">
+            <label>Add Citizens:</label>
+            <input type="number" id="sub-input" value="100">
+        </div>
+        <div class="row" style="justify-content: flex-start;">
+            <input type="checkbox" id="anim-toggle" checked>
+            <label for="anim-toggle">Animate Building Pop-up</label>
+        </div>
+        <button class="btn-primary" onclick="simulate()">Simulate Growth</button>
+    </div>
+
+    <div class="section">
+        <h3>Builder Tools</h3>
+        <p class="help-text">Draw directly on the 2D Map.</p>
+        <div class="tool-grid">
+            <button class="tool-btn active" id="tool-none" onclick="setTool('none')">Pan Map</button>
+            <button class="tool-btn" id="tool-reserve" onclick="setTool('reserve')">Reserve Plot</button>
+            <button class="tool-btn" id="tool-road" onclick="setTool('road')">Add Road</button>
+            <button class="tool-btn" id="tool-remove" onclick="setTool('remove')">Remove Plot</button>
+        </div>
+        <button class="btn-secondary" onclick="sendCmd('UNDO')" style="margin-top:8px;">↶ Undo</button>
+    </div>
+
+    <div class="section">
+        <h3>Save Data</h3>
+        <p class="help-text">City auto-saves to browser storage. Roads, houses, and names persist; manual save also exports.</p>
+        <button class="btn-success" onclick="sendCmd('SAVE')">💾 Save Now</button>
+        <button class="btn-secondary" onclick="sendCmd('LOAD')">↺ Reload from Save</button>
+        <button class="btn-danger" onclick="confirmReset()">🗑 Reset City</button>
+    </div>
+
+    <div id="stats">Awaiting Connection...</div>
+</div>
+
+<div id="minimap-container">
+    <canvas id="minimap"></canvas>
+    <div id="toast-container"></div>
+    <div id="map-legend">
+        <div class="legend-col">
+            <div class="legend-item"><div class="legend-color" style="background:#555963;"></div>House</div>
+            <div class="legend-item"><div class="legend-color" style="background:#a9b1bd;"></div>Auto Road</div>
+            <div class="legend-item"><div class="legend-color" style="background:#ffcc00;"></div>Manual Road</div>
+            <div class="legend-item"><div class="legend-color" style="background:#cc4444;"></div>Reserved</div>
+        </div>
+        <div class="legend-col">
+            <div class="legend-item"><div class="legend-color" style="background:#2d4233;"></div>Forest</div>
+            <div class="legend-item"><div class="legend-color" style="background:#6b5438;"></div>Field / Dirt</div>
+            <div class="legend-item"><div class="legend-color" style="background:#2a4b5c;"></div>Shallow Water</div>
+        </div>
+    </div>
+</div>
+
+<script>
+    // --- 1. CHANNEL & TOAST ---
+    const channel = new BroadcastChannel('city_sync');
+    function sendCmd(type, payload = {}) { channel.postMessage({ type: type, ...payload }); }
+
+    function toast(text, level = 'info', duration = 4000) {
+        const container = document.getElementById('toast-container');
+        const el = document.createElement('div');
+        el.className = 'toast ' + level;
+        el.textContent = text;
+        container.appendChild(el);
+        setTimeout(() => {
+            el.classList.add('fading');
+            setTimeout(() => el.remove(), 400);
+        }, duration);
+        // Cap stack at 5
+        while (container.children.length > 5) container.firstChild.remove();
+    }
+
+    // --- 2. UI ACTIONS ---
+    function simulate() { sendCmd('SIMULATE', { count: parseInt(document.getElementById('sub-input').value) || 1, anim: document.getElementById('anim-toggle').checked }); }
+    function search() {
+        const term = document.getElementById('search-input').value;
+        if (!term.trim()) return;
+        sendCmd('SEARCH', { term: term });
+    }
+    function setTheme() { sendCmd('SET_THEME', { theme: document.getElementById('theme-select').value }); }
+    function confirmReset() {
+        if (confirm('Reset the entire city? This cannot be undone.')) sendCmd('RESET');
+    }
+
+    let currentDashboardTool = 'none';
+    function setTool(toolName) {
+        currentDashboardTool = toolName;
+        document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
+        document.getElementById('tool-' + toolName).classList.add('active');
+
+        const container = document.getElementById('minimap-container');
+        if (toolName === 'none') container.classList.remove('building');
+        else container.classList.add('building');
+
+        sendCmd('SET_TOOL', { tool: toolName });
+    }
+
+    // Keyboard shortcut: Ctrl/Cmd+Z for undo
+    window.addEventListener('keydown', (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+            e.preventDefault();
+            sendCmd('UNDO');
+        }
+    });
+
+    // --- 3. CHANNEL HANDLER (DIFF SYNC) ---
+    let cityMap = new Map(); // grid key -> type
+    let needsRedraw = false;
+
+    channel.onmessage = (event) => {
+        const data = event.data;
+        switch (data.type) {
+            case 'MAP_FULL':
+                cityMap = new Map(data.map);
+                document.getElementById('stats').innerText = `Population: ${data.pop} | Chunks: ${data.chunks}`;
+                needsRedraw = true;
+                break;
+            case 'DIFFS':
+                for (const d of data.diffs) {
+                    const key = `${d.x},${d.z}`;
+                    if (d.op === 'add') cityMap.set(key, d.t);
+                    else if (d.op === 'rm') cityMap.delete(key);
+                }
+                needsRedraw = true;
+                break;
+            case 'STATS':
+                document.getElementById('stats').innerText = `Population: ${data.pop} | Chunks: ${data.chunks}`;
+                break;
+            case 'TOAST':
+                toast(data.text, data.level || 'info');
+                break;
+            case 'RENDERER_READY':
+                // Renderer just booted; ask for full snapshot
+                sendCmd('REQUEST_FULL_MAP');
+                break;
+        }
+    };
+
+    // Request snapshot on startup (in case renderer was already running)
+    setTimeout(() => sendCmd('REQUEST_FULL_MAP'), 200);
+
+    // Redraw at most every 50ms when dirty
+    setInterval(() => { if (needsRedraw) { drawMap(); needsRedraw = false; } }, 50);
+
+    // --- 4. 2D MINIMAP ---
+    const canvas = document.getElementById('minimap');
+    const ctx = canvas.getContext('2d');
+
+    let offsetX = 0; let offsetY = 0; let scale = 12;
+    let isDragging = false; let isBuilding = false;
+    let lastX = 0; let lastY = 0;
+    let lastBuildCell = null;
+
+    function resizeCanvas() {
+        canvas.width = canvas.parentElement.clientWidth;
+        canvas.height = canvas.parentElement.clientHeight;
+        drawMap();
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    canvas.addEventListener('mousedown', (e) => {
+        if (currentDashboardTool !== 'none' && e.button === 0) {
+            isBuilding = true;
+            processBuildClick(e);
+        } else {
+            isDragging = true;
+            lastX = e.clientX; lastY = e.clientY;
+        }
+    });
+
+    window.addEventListener('mouseup', () => {
+        isDragging = false;
+        isBuilding = false;
+        lastBuildCell = null;
+    });
+
+    window.addEventListener('mousemove', (e) => {
+        if (isDragging) {
+            offsetX += e.clientX - lastX;
+            offsetY += e.clientY - lastY;
+            lastX = e.clientX; lastY = e.clientY;
+            drawMap();
+        } else if (isBuilding) {
+            processBuildClick(e);
+        }
+    });
+
+    canvas.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const zoom = e.deltaY < 0 ? 1.1 : 0.9;
+        scale = Math.max(3, Math.min(scale * zoom, 50));
+        drawMap();
+    });
+
+    function processBuildClick(e) {
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+
+        const cx = (canvas.width / 2) + offsetX;
+        const cy = (canvas.height / 2) + offsetY;
+
+        const gx = Math.floor((mouseX - cx) / scale);
+        const gz = Math.floor((mouseY - cy) / scale);
+
+        const cellKey = `${gx},${gz}`;
+        if (lastBuildCell !== cellKey) {
+            lastBuildCell = cellKey;
+            // Renderer is authoritative — just send the request and wait for the diff back
+            sendCmd('BUILD_ACTION', { tool: currentDashboardTool, x: gx, z: gz });
+        }
+    }
+
+    function drawMap() {
+        ctx.fillStyle = '#0f1115';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        const cx = (canvas.width / 2) + offsetX;
+        const cy = (canvas.height / 2) + offsetY;
+
+        // Grid
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+        ctx.lineWidth = 1;
+        const gridSize = scale;
+        for (let x = cx % gridSize; x < canvas.width; x += gridSize) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke(); }
+        for (let y = cy % gridSize; y < canvas.height; y += gridSize) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke(); }
+
+        // Cells
+        for (const [key, type] of cityMap.entries()) {
+            const [gx, gz] = key.split(',').map(Number);
+
+            if (type === 'H') ctx.fillStyle = '#555963';
+            else if (type === 'R') ctx.fillStyle = '#a9b1bd';
+            else if (type === 'R_MANUAL') ctx.fillStyle = '#ffcc00';
+            else if (type === 'RES') ctx.fillStyle = '#cc4444';
+            else if (type === 'N_W') ctx.fillStyle = '#2a4b5c';
+            else if (type === 'N_F') ctx.fillStyle = '#2d4233';
+            else if (type === 'N_D') ctx.fillStyle = '#6b5438';
+            else ctx.fillStyle = '#ffffff';
+
+            ctx.fillRect(cx + (gx * scale) + 1, cy + (gz * scale) + 1, scale - 2, scale - 2);
+        }
+
+        // Origin crosshair
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+        ctx.fillRect(cx - 2, cy - 10, 4, 20);
+        ctx.fillRect(cx - 10, cy - 2, 20, 4);
+    }
+
+    // ==========================================================
+    // 5. TWITCH EVENTSUB INTEGRATION
+    // ==========================================================
+    const TWITCH_LS = {
+        clientId: 'twitch_client_id',
+        token: 'twitch_access_token',
+        userId: 'twitch_user_id',
+        userLogin: 'twitch_user_login'
+    };
+    const TWITCH_SCOPES = [
+        'moderator:read:followers',     // channel.follow v2
+        'channel:read:subscriptions',   // channel.subscribe + gifts
+        // (channel.raid needs no scope)
+    ].join('+');
+    const REDIRECT_URI = window.location.origin + window.location.pathname;
+    document.getElementById('redirect-uri-display').textContent = REDIRECT_URI;
+
+    let twitchSocket = null;
+    let twitchSessionId = null;
+    let twitchKeepaliveTimer = null;
+    let twitchKeepaliveSeconds = 30;
+
+    function setTwitchStatus(state, text) {
+        const el = document.getElementById('twitch-status');
+        el.className = 'twitch-status ' + state;
+        el.textContent = text;
+        document.getElementById('twitch-connect-btn').style.display = (state === 'connected') ? 'none' : 'block';
+        document.getElementById('twitch-disconnect-btn').style.display = (state === 'connected') ? 'block' : 'none';
+    }
+
+    // Restore stored Client ID into the input
+    {
+        const stored = localStorage.getItem(TWITCH_LS.clientId);
+        if (stored) document.getElementById('twitch-client-id').value = stored;
+    }
+
+    function twitchConnect() {
+        const clientId = document.getElementById('twitch-client-id').value.trim();
+        if (!clientId) {
+            toast('Enter your Twitch Client ID first', 'warn');
+            document.getElementById('twitch-config').open = true;
+            return;
+        }
+        localStorage.setItem(TWITCH_LS.clientId, clientId);
+
+        // If we already have a valid token, skip OAuth
+        const existingToken = localStorage.getItem(TWITCH_LS.token);
+        if (existingToken) {
+            setTwitchStatus('connecting', 'Validating token...');
+            validateAndOpenSocket(existingToken, clientId);
+            return;
+        }
+
+        // Implicit OAuth: redirect to Twitch
+        const url = `https://id.twitch.tv/oauth2/authorize` +
+            `?response_type=token` +
+            `&client_id=${encodeURIComponent(clientId)}` +
+            `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
+            `&scope=${TWITCH_SCOPES}` +
+            `&force_verify=true`;
+        window.location.href = url;
+    }
+
+    function twitchDisconnect() {
+        if (twitchSocket) { try { twitchSocket.close(); } catch(e){} twitchSocket = null; }
+        if (twitchKeepaliveTimer) { clearTimeout(twitchKeepaliveTimer); twitchKeepaliveTimer = null; }
+        localStorage.removeItem(TWITCH_LS.token);
+        localStorage.removeItem(TWITCH_LS.userId);
+        localStorage.removeItem(TWITCH_LS.userLogin);
+        setTwitchStatus('disconnected', 'Disconnected');
+        toast('Twitch disconnected', 'info');
+    }
+
+    function twitchTestEvent() {
+        const fakeNames = ['TestViewer', 'PixelPusher42', 'NightOwl', 'StreamFan', 'CityBuilder99'];
+        const name = fakeNames[Math.floor(Math.random() * fakeNames.length)] + '_' + Math.floor(Math.random() * 1000);
+        sendCmd('SPAWN_REAL', { name });
+        toast(`🧪 Test follow: ${name}`, 'event');
+    }
+
+    // Parse OAuth implicit flow redirect (#access_token=...)
+    function consumeOAuthFragment() {
+        if (!window.location.hash || window.location.hash.length < 2) return null;
+        const params = new URLSearchParams(window.location.hash.substring(1));
+        const token = params.get('access_token');
+        if (!token) return null;
+        // Clean URL so the token isn't sitting in the address bar / history
+        history.replaceState(null, '', window.location.pathname + window.location.search);
+        return token;
+    }
+
+    async function validateAndOpenSocket(token, clientId) {
+        let validation;
+        try {
+            const r = await fetch('https://id.twitch.tv/oauth2/validate', {
+                headers: { 'Authorization': 'OAuth ' + token }
+            });
+            if (!r.ok) throw new Error(`Validate ${r.status}`);
+            validation = await r.json();
+        } catch (err) {
+            toast('Token invalid; please reconnect', 'error');
+            localStorage.removeItem(TWITCH_LS.token);
+            setTwitchStatus('disconnected', 'Disconnected');
+            return;
+        }
+        // Sanity-check that returned client_id matches
+        if (validation.client_id !== clientId) {
+            toast('Token does not match Client ID', 'error');
+            localStorage.removeItem(TWITCH_LS.token);
+            setTwitchStatus('disconnected', 'Disconnected');
+            return;
+        }
+        localStorage.setItem(TWITCH_LS.token, token);
+        localStorage.setItem(TWITCH_LS.userId, validation.user_id);
+        localStorage.setItem(TWITCH_LS.userLogin, validation.login);
+        setTwitchStatus('connecting', `Hi ${validation.login} — opening socket…`);
+        openEventSubSocket(token, clientId, validation.user_id);
+    }
+
+    function openEventSubSocket(token, clientId, userId, url = 'wss://eventsub.wss.twitch.tv/ws') {
+        twitchSocket = new WebSocket(url);
+
+        twitchSocket.addEventListener('open', () => {
+            // Wait for session_welcome before subscribing
+        });
+
+        twitchSocket.addEventListener('message', async (msg) => {
+            let payload;
+            try { payload = JSON.parse(msg.data); } catch (e) { return; }
+            const meta = payload.metadata || {};
+            const data = payload.payload || {};
+
+            resetKeepalive();
+
+            if (meta.message_type === 'session_welcome') {
+                twitchSessionId = data.session.id;
+                twitchKeepaliveSeconds = data.session.keepalive_timeout_seconds || 30;
+                resetKeepalive();
+                await subscribeToEvents(token, clientId, userId, twitchSessionId);
+                setTwitchStatus('connected', `Connected as ${localStorage.getItem(TWITCH_LS.userLogin)}`);
+                toast('🟢 Twitch live — listening for events', 'event');
+            } else if (meta.message_type === 'session_keepalive') {
+                // No-op; keepalive timer was reset above
+            } else if (meta.message_type === 'session_reconnect') {
+                // Twitch wants us to migrate to a new URL
+                const newUrl = data.session.reconnect_url;
+                const oldSocket = twitchSocket;
+                openEventSubSocket(token, clientId, userId, newUrl);
+                try { oldSocket.close(); } catch (e) {}
+            } else if (meta.message_type === 'notification') {
+                handleTwitchNotification(meta.subscription_type, data.event);
+            } else if (meta.message_type === 'revocation') {
+                toast(`Subscription revoked: ${meta.subscription_type}`, 'warn');
+            }
+        });
+
+        twitchSocket.addEventListener('close', (e) => {
+            if (twitchKeepaliveTimer) { clearTimeout(twitchKeepaliveTimer); twitchKeepaliveTimer = null; }
+            // Only auto-reconnect if user didn't manually disconnect
+            if (localStorage.getItem(TWITCH_LS.token)) {
+                setTwitchStatus('connecting', `Reconnecting in 5s… (code ${e.code})`);
+                setTimeout(() => {
+                    const t = localStorage.getItem(TWITCH_LS.token);
+                    const cid = localStorage.getItem(TWITCH_LS.clientId);
+                    const uid = localStorage.getItem(TWITCH_LS.userId);
+                    if (t && cid && uid) openEventSubSocket(t, cid, uid);
+                }, 5000);
+            }
+        });
+
+        twitchSocket.addEventListener('error', () => {
+            toast('Twitch WebSocket error', 'error');
+        });
+    }
+
+    function resetKeepalive() {
+        if (twitchKeepaliveTimer) clearTimeout(twitchKeepaliveTimer);
+        // Twitch closes the socket if no message in keepalive_timeout. Pad by 10s before forcing reconnect.
+        twitchKeepaliveTimer = setTimeout(() => {
+            if (twitchSocket) {
+                try { twitchSocket.close(); } catch (e) {}
+            }
+        }, (twitchKeepaliveSeconds + 10) * 1000);
+    }
+
+    async function subscribeToEvents(token, clientId, userId, sessionId) {
+        const subs = [
+            { type: 'channel.follow', version: '2', condition: { broadcaster_user_id: userId, moderator_user_id: userId } },
+            { type: 'channel.subscribe', version: '1', condition: { broadcaster_user_id: userId } },
+            { type: 'channel.subscription.gift', version: '1', condition: { broadcaster_user_id: userId } },
+            { type: 'channel.raid', version: '1', condition: { to_broadcaster_user_id: userId } }
+        ];
+        let ok = 0, fail = 0;
+        for (const sub of subs) {
+            try {
+                const r = await fetch('https://api.twitch.tv/helix/eventsub/subscriptions', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': 'Bearer ' + token,
+                        'Client-Id': clientId,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        type: sub.type,
+                        version: sub.version,
+                        condition: sub.condition,
+                        transport: { method: 'websocket', session_id: sessionId }
+                    })
+                });
+                if (r.ok || r.status === 202) ok++;
+                else {
+                    fail++;
+                    const body = await r.text();
+                    console.warn(`Subscribe ${sub.type} failed: ${r.status}`, body);
+                    toast(`Couldn't subscribe to ${sub.type} (${r.status})`, 'warn', 6000);
+                }
+            } catch (err) {
+                fail++;
+                console.error(err);
+            }
+        }
+        if (ok > 0) toast(`Subscribed to ${ok} event types`, 'event');
+    }
+
+    function handleTwitchNotification(subType, event) {
+        let name = null;
+        let label = '';
+        if (subType === 'channel.follow') {
+            name = event.user_name; label = `🆕 Follow: ${name}`;
+        } else if (subType === 'channel.subscribe') {
+            name = event.user_name; label = `⭐ Sub: ${name}`;
+        } else if (subType === 'channel.subscription.gift') {
+            name = event.is_anonymous ? 'AnonymousGifter' : event.user_name;
+            const total = event.total || 1;
+            label = `🎁 ${name} gifted ${total} sub${total > 1 ? 's' : ''}`;
+            // Spawn one house per gifted sub for extra spectacle
+            for (let i = 0; i < Math.min(total, 25); i++) {
+                sendCmd('SPAWN_REAL', { name: total === 1 ? name : `${name}'s gift #${i+1}` });
+            }
+            toast(label, 'event', 6000);
+            return;
+        } else if (subType === 'channel.raid') {
+            name = event.from_broadcaster_user_name;
+            const viewers = event.viewers || 1;
+            label = `⚔️ Raid by ${name} (${viewers} viewers)`;
+            // One house for the raider, optionally a few for raiders
+            sendCmd('SPAWN_REAL', { name });
+            const extras = Math.min(viewers, 10);
+            for (let i = 0; i < extras; i++) {
+                sendCmd('SPAWN_REAL', { name: `${name}'s raider #${i+1}` });
+            }
+            toast(label, 'event', 6000);
+            return;
+        }
+        if (name) {
+            sendCmd('SPAWN_REAL', { name });
+            toast(label, 'event');
+        }
+    }
+
+    // --- 6. BOOT TWITCH ---
+    (function bootTwitch() {
+        const fragmentToken = consumeOAuthFragment();
+        const storedClientId = localStorage.getItem(TWITCH_LS.clientId);
+        if (fragmentToken && storedClientId) {
+            setTwitchStatus('connecting', 'Got token, validating...');
+            validateAndOpenSocket(fragmentToken, storedClientId);
+        } else {
+            const storedToken = localStorage.getItem(TWITCH_LS.token);
+            if (storedToken && storedClientId) {
+                setTwitchStatus('connecting', 'Reconnecting...');
+                validateAndOpenSocket(storedToken, storedClientId);
+            } else {
+                setTwitchStatus('disconnected', 'Disconnected');
+            }
+        }
+    })();
+</script>
+
+</body>
+</html>

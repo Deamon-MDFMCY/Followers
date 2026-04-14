@@ -1,0 +1,1008 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Infinite City Engine - Renderer</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #121c26; font-family: sans-serif; cursor: default; }
+        body.edit-mode { cursor: crosshair; }
+        #tooltip {
+            position: absolute; background: rgba(0, 0, 0, 0.9); color: #fff;
+            padding: 10px 15px; border-radius: 6px; pointer-events: none; opacity: 0;
+            font-weight: bold; font-size: 15px; transform: translate(-50%, -150%);
+            border: 2px solid #ffd700; box-shadow: 0px 4px 10px rgba(0,0,0,0.5);
+            z-index: 100; white-space: nowrap; transition: opacity 0.2s;
+        }
+        #save-indicator {
+            position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.6);
+            color: #00ffcc; padding: 4px 10px; border-radius: 4px; font-size: 11px;
+            opacity: 0; transition: opacity 0.3s; z-index: 99; pointer-events: none;
+        }
+        #save-indicator.visible { opacity: 1; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+
+    <div id="tooltip">Subscriber Name</div>
+    <div id="save-indicator">Saved</div>
+
+    <script>
+        // --- 1. CHANNEL COMMUNICATION & STATE ---
+        const channel = new BroadcastChannel('city_sync');
+        let currentTool = 'none';
+        let is2DMode = false;
+        let currentTheme = 'nocturne';
+        const WORLD_SEED = 133742;
+        const SAVE_KEY = 'city_save_v1';
+        const SAVE_DEBOUNCE_MS = 1000;
+        const UNDO_LIMIT = 100;
+
+        // Pending diffs to send to the UI on next sync tick
+        let pendingDiffs = [];
+        let statsDirty = true;
+        // Undo stack: each entry is a self-contained inverse action
+        let undoStack = [];
+        // Action log for persistence: complete record of city construction
+        let actionLog = [];
+        let saveTimer = null;
+        let isRestoring = false; // suppress autosave + undo logging during replay
+
+        const channelHandlers = {
+            TOGGLE_ROTATION: () => { controls.autoRotate = !controls.autoRotate; },
+            TOGGLE_VIEW: () => {
+                is2DMode = !is2DMode; controls.autoRotate = false; controls.enableRotate = !is2DMode;
+                targetCameraPos.set(controls.target.x + (is2DMode ? 0 : 100), is2DMode ? 300 : 100, controls.target.z + (is2DMode ? 0 : 100));
+                targetControlsPos.copy(controls.target); targetCameraZoom = is2DMode ? 0.8 : 1.0; isCameraAnimating = true;
+            },
+            SIMULATE: (d) => simulateSubscribers(d.count, d.anim),
+            SPAWN_REAL: (d) => spawnSubscriber(true, d.name),
+            SEARCH: (d) => searchSubscriber(d.term),
+            SET_TOOL: (d) => {
+                currentTool = d.tool; document.body.className = currentTool === 'none' ? '' : 'edit-mode';
+                controls.enableRotate = (currentTool === 'none' && !is2DMode);
+            },
+            BUILD_ACTION: (d) => {
+                if (d.tool === 'reserve') reserveParcel(d.x, d.z);
+                else if (d.tool === 'road') addRoad(d.x, d.z, null, true);
+                else if (d.tool === 'remove') removeGridItem(d.x, d.z);
+            },
+            SET_THEME: (d) => { if (themes[d.theme]) { currentTheme = d.theme; applyTheme(); } },
+            REQUEST_FULL_MAP: () => sendFullMap(),
+            UNDO: () => performUndo(),
+            SAVE: () => { saveNow(); flashSaveIndicator(); },
+            LOAD: () => { loadFromStorage(true); },
+            RESET: () => { resetCity(); }
+        };
+
+        channel.onmessage = (event) => {
+            const h = channelHandlers[event.data.type];
+            if (h) h(event.data);
+        };
+
+        // --- DIFF SYNC ---
+        function emitCellAdded(gx, gz, type) {
+            pendingDiffs.push({ op: 'add', x: gx, z: gz, t: type });
+            statsDirty = true;
+        }
+        function emitCellRemoved(gx, gz) {
+            pendingDiffs.push({ op: 'rm', x: gx, z: gz });
+            statsDirty = true;
+        }
+        function sendFullMap() {
+            channel.postMessage({
+                type: 'MAP_FULL',
+                map: Array.from(gridMap.entries()),
+                pop: populationCount,
+                chunks: chunks.length
+            });
+            pendingDiffs = []; statsDirty = false;
+        }
+        // 100ms tick: flush pending diffs
+        setInterval(() => {
+            if (pendingDiffs.length > 0) {
+                channel.postMessage({ type: 'DIFFS', diffs: pendingDiffs });
+                pendingDiffs = [];
+            }
+            if (statsDirty) {
+                channel.postMessage({ type: 'STATS', pop: populationCount, chunks: chunks.length });
+                statsDirty = false;
+            }
+        }, 100);
+        // Announce ready so UI can request a full snapshot
+        setTimeout(() => channel.postMessage({ type: 'RENDERER_READY' }), 100);
+
+        // --- 2. BIOME & NOISE SYSTEM ---
+        function getBiomeNoise(x, z) {
+            let scale = 0.03; let n = Math.sin(x * scale) + Math.cos(z * scale) + Math.sin((x + z) * scale * 1.5) * 0.5 + Math.cos((x - z) * scale * 0.8) * 0.5; return (n + 3) / 6;
+        }
+        function jitterColor(hex, amount) {
+            let r = (hex >> 16) & 0xff; let g = (hex >> 8) & 0xff; let b = hex & 0xff;
+            let j = (Math.random() - 0.5) * amount; r = Math.max(0, Math.min(255, r + j)); g = Math.max(0, Math.min(255, g + j)); b = Math.max(0, Math.min(255, b + j));
+            return (r << 16) | (g << 8) | b;
+        }
+        function hash01(a, b = 0, c = 0) {
+            let n = (a * 374761393 + b * 668265263 + c * 1442695041 + WORLD_SEED * 374761393) | 0;
+            n = (n ^ (n >> 13)) * 1274126177;
+            n = n ^ (n >> 16);
+            return (n >>> 0) / 4294967295;
+        }
+
+        const themes = {
+            nocturne: {
+                bg: 0x121c26, fog: 0x121c26, ocean: 0x1a2e3b, water: 0x2a4b5c, field: 0x6b5438, forestGround: 0x2d4233,
+                houseColors: [0x3b3d42, 0x47494e, 0x2d2e33, 0x51545a], leafColors: [0x354a3d, 0x3e5446, 0x293d31, 0x485d4b],
+                trunk: 0x3b342d, roof: 0x24262a, road: 0x4a4d54
+            },
+            synthwave: {
+                bg: 0x180c2a, fog: 0x180c2a, ocean: 0x21153a, water: 0x3c2f78, field: 0x5b3750, forestGround: 0x2b1f42,
+                houseColors: [0x5e4db2, 0x7f65d9, 0x51379a, 0x8a6df2], leafColors: [0x365a7a, 0x4f6fb0, 0x2c4966, 0x6383c2],
+                trunk: 0x48345a, roof: 0x2a2140, road: 0x3a3553
+            },
+            verdant: {
+                bg: 0x0f1a16, fog: 0x0f1a16, ocean: 0x1c2f34, water: 0x2a5960, field: 0x5e6339, forestGround: 0x284529,
+                houseColors: [0x66614a, 0x7a6f57, 0x564f3d, 0x8a7f67], leafColors: [0x3d6438, 0x487a42, 0x2f5230, 0x5a8c4f],
+                trunk: 0x4b3a2a, roof: 0x353229, road: 0x50584a
+            }
+        };
+
+        // --- 3. SCENE SETUP ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(themes[currentTheme].bg);
+        scene.fog = new THREE.Fog(themes[currentTheme].fog, 100, 2000);
+
+        const aspect = window.innerWidth / window.innerHeight; const d = 120;
+        const camera = new THREE.OrthographicCamera(-d * aspect, d * aspect, d, -d, -10000, 20000); camera.position.set(100, 100, 100);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+        renderer.setSize(window.innerWidth, window.innerHeight); renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        renderer.outputEncoding = THREE.sRGBEncoding;
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true; controls.dampingFactor = 0.05; controls.autoRotate = true; controls.autoRotateSpeed = 0.5;
+
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.75); scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0); dirLight.position.set(200, 300, 100); dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 4096; dirLight.shadow.mapSize.height = 4096; dirLight.shadow.camera.left = -1000; dirLight.shadow.camera.right = 1000;
+        dirLight.shadow.camera.top = 1000; dirLight.shadow.camera.bottom = -1000; scene.add(dirLight);
+
+        const planeGeo = new THREE.PlaneGeometry(50000, 50000); const planeMat = new THREE.MeshStandardMaterial({ color: themes[currentTheme].ocean, roughness: 0.8 });
+        const plane = new THREE.Mesh(planeGeo, planeMat); plane.rotation.x = -Math.PI / 2; plane.position.y = -0.5; plane.receiveShadow = true; scene.add(plane);
+
+        // --- 4. DYNAMIC CHUNK SYSTEM ---
+        const HOUSES_PER_CHUNK = 20000;
+        const boxGeo = new THREE.BoxGeometry(1, 1, 1); const plane1Geo = new THREE.PlaneGeometry(1, 1);
+        const roofGeo = new THREE.CylinderGeometry(0, 0.5, 1, 4); roofGeo.rotateY(Math.PI / 4);
+        const trunkGeo = new THREE.CylinderGeometry(0.15, 0.15, 1, 4); trunkGeo.rotateY(Math.PI / 4);
+        const pineGeo = new THREE.CylinderGeometry(0, 0.5, 1, 4); pineGeo.rotateY(Math.PI / 4);
+
+        const groundGeo = new THREE.PlaneGeometry(5.0, 5.0); groundGeo.rotateX(-Math.PI / 2);
+
+        function makeNoiseTexture(baseHex, jitter, size = 64) {
+            const canvas = document.createElement('canvas'); canvas.width = size; canvas.height = size;
+            const c2 = canvas.getContext('2d');
+            const br = (baseHex >> 16) & 255; const bg = (baseHex >> 8) & 255; const bb = baseHex & 255;
+            const img = c2.createImageData(size, size);
+            for (let i = 0; i < img.data.length; i += 4) {
+                const n = (Math.random() - 0.5) * jitter;
+                img.data[i] = Math.max(0, Math.min(255, br + n));
+                img.data[i + 1] = Math.max(0, Math.min(255, bg + n));
+                img.data[i + 2] = Math.max(0, Math.min(255, bb + n));
+                img.data[i + 3] = 255;
+            }
+            c2.putImageData(img, 0, 0);
+            const tx = new THREE.CanvasTexture(canvas);
+            tx.wrapS = THREE.RepeatWrapping; tx.wrapT = THREE.RepeatWrapping; tx.repeat.set(2, 2);
+            return tx;
+        }
+
+        const wallMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.92, map: makeNoiseTexture(0x808080, 22) });
+        const roofMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.88, map: makeNoiseTexture(0x5a5a5a, 28) });
+        const roadMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.94, map: makeNoiseTexture(0x4a4d54, 18) });
+        const winMat = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xffeebb, emissiveIntensity: 1.2 });
+        const trunkMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, map: makeNoiseTexture(0x5a4633, 18) });
+        const foliageMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.98, map: makeNoiseTexture(0x35503a, 16) });
+        const propMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9, map: makeNoiseTexture(0x6b5b4f, 22) });
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1.0, map: makeNoiseTexture(0x5b654f, 16) });
+        const waterMat = new THREE.MeshStandardMaterial({ color: themes[currentTheme].water, roughness: 0.18, metalness: 0.08, transparent: true, opacity: 0.9 });
+
+        let chunks = []; let houseData = []; let activeAnimations = [];
+        const animatedWater = [];
+        const dummy = new THREE.Object3D(); const dummyColor = new THREE.Color(); const highlightColor = new THREE.Color(0xffd700);
+
+        function createChunk() {
+            let cIdx = chunks.length;
+            let c = {
+                idx: cIdx, houseCount: 0,
+                walls: new THREE.InstancedMesh(boxGeo, wallMat, HOUSES_PER_CHUNK * 6), roofs: new THREE.InstancedMesh(roofGeo, roofMat, HOUSES_PER_CHUNK),
+                windows: new THREE.InstancedMesh(plane1Geo, winMat, HOUSES_PER_CHUNK * 3), roads: new THREE.InstancedMesh(plane1Geo, roadMat, HOUSES_PER_CHUNK * 2),
+                trunks: new THREE.InstancedMesh(trunkGeo, trunkMat, HOUSES_PER_CHUNK * 3), crowns: new THREE.InstancedMesh(pineGeo, foliageMat, HOUSES_PER_CHUNK * 6),
+                bushes: new THREE.InstancedMesh(boxGeo, foliageMat, HOUSES_PER_CHUNK * 4),
+                pBoxes: new THREE.InstancedMesh(boxGeo, propMat, HOUSES_PER_CHUNK * 4), pGlows: new THREE.InstancedMesh(boxGeo, winMat, HOUSES_PER_CHUNK),
+                grounds: new THREE.InstancedMesh(groundGeo, groundMat, HOUSES_PER_CHUNK * 2),
+                waters: new THREE.InstancedMesh(groundGeo, waterMat, HOUSES_PER_CHUNK * 2),
+                wCount: 0, rCount: 0, winCount: 0, rdCount: 0, trCount: 0, crCount: 0, bCount: 0, pbCount: 0, pgCount: 0, gCount: 0, waCount: 0,
+                wallToHouse: new Int32Array(HOUSES_PER_CHUNK * 6), roofToHouse: new Int32Array(HOUSES_PER_CHUNK),
+                instanceToGrid: new Map()
+            };
+
+            dummy.scale.set(0,0,0); dummy.updateMatrix();
+            for(let i=0; i<HOUSES_PER_CHUNK * 6; i++) { c.walls.setMatrixAt(i, dummy.matrix); c.crowns.setMatrixAt(i, dummy.matrix); }
+            for(let i=0; i<HOUSES_PER_CHUNK * 4; i++) { c.bushes.setMatrixAt(i, dummy.matrix); c.pBoxes.setMatrixAt(i, dummy.matrix); }
+            for(let i=0; i<HOUSES_PER_CHUNK * 3; i++) { c.windows.setMatrixAt(i, dummy.matrix); c.trunks.setMatrixAt(i, dummy.matrix); }
+            for(let i=0; i<HOUSES_PER_CHUNK * 2; i++) { c.roads.setMatrixAt(i, dummy.matrix); c.grounds.setMatrixAt(i, dummy.matrix); c.waters.setMatrixAt(i, dummy.matrix); }
+            for(let i=0; i<HOUSES_PER_CHUNK; i++) { c.roofs.setMatrixAt(i, dummy.matrix); c.pGlows.setMatrixAt(i, dummy.matrix); }
+
+            c.walls.userData = { chunkIdx: cIdx, isRoof: false }; c.roofs.userData = { chunkIdx: cIdx, isRoof: true };
+            c.walls.castShadow = true; c.walls.receiveShadow = true; c.roofs.castShadow = true; c.roofs.receiveShadow = true;
+            c.trunks.castShadow = true; c.trunks.receiveShadow = true; c.crowns.castShadow = true; c.crowns.receiveShadow = true;
+            c.bushes.castShadow = true; c.bushes.receiveShadow = true; c.roads.receiveShadow = true; c.pBoxes.castShadow = true; c.pBoxes.receiveShadow = true;
+            c.grounds.receiveShadow = true; c.waters.receiveShadow = true;
+
+            scene.add(c.walls); scene.add(c.roofs); scene.add(c.windows); scene.add(c.roads); scene.add(c.trunks);
+            scene.add(c.crowns); scene.add(c.bushes); scene.add(c.pBoxes); scene.add(c.pGlows); scene.add(c.grounds); scene.add(c.waters);
+            chunks.push(c); return c;
+        }
+
+        function getActiveChunk() {
+            if (chunks.length === 0) return createChunk();
+            let last = chunks[chunks.length - 1];
+            if (last.houseCount >= HOUSES_PER_CHUNK || last.rdCount >= HOUSES_PER_CHUNK * 1.8 || last.crCount >= HOUSES_PER_CHUNK * 5.5 || last.gCount >= HOUSES_PER_CHUNK * 1.8) return createChunk();
+            return last;
+        }
+
+        // --- 5. INSTANCE PLACEMENT ---
+        function addGroundInstance(c, x, y, z, colorHex, isAnim) {
+            let s = isAnim ? 0.01 : 1.0;
+            dummy.position.set(x, y, z); dummy.rotation.set(0, 0, 0); dummy.scale.set(s, s, s); dummy.updateMatrix();
+            let id = c.gCount; c.grounds.setMatrixAt(id, dummy.matrix); dummyColor.setHex(colorHex); c.grounds.setColorAt(id, dummyColor);
+            c.gCount++; c.grounds.instanceMatrix.needsUpdate = true; c.grounds.instanceColor.needsUpdate = true;
+            return { type: 'ground', id: id, x: x, y: y, z: z, rotY: 0, sx: 1.0, sy: 1.0, sz: 1.0 };
+        }
+
+        function addWaterInstance(c, x, y, z, colorHex) {
+            dummy.position.set(x, y, z); dummy.rotation.set(0, 0, 0); dummy.scale.set(1.0, 1.0, 1.0); dummy.updateMatrix();
+            let id = c.waCount; c.waters.setMatrixAt(id, dummy.matrix); dummyColor.setHex(colorHex); c.waters.setColorAt(id, dummyColor);
+            c.waCount++; c.waters.instanceMatrix.needsUpdate = true; c.waters.instanceColor.needsUpdate = true;
+            animatedWater.push({ chunk: c, id: id, x: x, z: z, baseY: y, phase: hash01(Math.floor(x), Math.floor(z), 919) * Math.PI * 2 });
+            return { type: 'water', id: id };
+        }
+
+        function addBlockInstance(c, x, y, z, w, h, d, rotY, colorHex, isAnim, houseId) {
+            let s = isAnim ? 0.01 : 1.0; dummy.position.set(x, y, z); dummy.rotation.set(0, rotY, 0); dummy.scale.set(w * s, h * s, d * s); dummy.updateMatrix();
+            let id = c.wCount; c.walls.setMatrixAt(id, dummy.matrix); dummyColor.setHex(colorHex); c.walls.setColorAt(id, dummyColor);
+            c.wallToHouse[id] = houseId; c.wCount++; c.walls.instanceMatrix.needsUpdate = true; c.walls.instanceColor.needsUpdate = true;
+            return { type: 'wall', id: id, x: x, y: y, z: z, rotY: rotY, sx: w, sy: h, sz: d };
+        }
+
+        function addRoofInstance(c, x, y, z, size, height, rotY, colorHex, isAnim, houseId) {
+            let s = isAnim ? 0.01 : 1.0; let sx = size * 1.414, sy = height, sz = size * 1.414;
+            dummy.position.set(x, y, z); dummy.rotation.set(0, rotY, 0); dummy.scale.set(sx * s, sy * s, sz * s); dummy.updateMatrix();
+            let id = c.rCount; c.roofs.setMatrixAt(id, dummy.matrix); dummyColor.setHex(colorHex); c.roofs.setColorAt(id, dummyColor);
+            c.roofToHouse[id] = houseId; c.rCount++; c.roofs.instanceMatrix.needsUpdate = true; c.roofs.instanceColor.needsUpdate = true;
+            return { type: 'roof', id: id, x: x, y: y, z: z, rotY: rotY, sx: sx, sy: sy, sz: sz };
+        }
+
+        function addWindowInstance(c, x, y, z, w, h, rotY, isAnim) {
+            let s = isAnim ? 0.01 : 1.0; dummy.position.set(x, y, z); dummy.rotation.set(0, rotY, 0); dummy.scale.set(w * s, h * s, 1 * s); dummy.updateMatrix();
+            let id = c.winCount; c.windows.setMatrixAt(id, dummy.matrix); c.winCount++; c.windows.instanceMatrix.needsUpdate = true;
+            return { type: 'window', id: id, x: x, y: y, z: z, rotY: rotY, sx: w, sy: h, sz: 1 };
+        }
+
+        function addPropBoxInstance(c, x, y, z, w, h, d, rotY, colorHex, isAnim) {
+            let s = isAnim ? 0.01 : 1.0; dummy.position.set(x, y, z); dummy.rotation.set(0, rotY, 0); dummy.scale.set(w * s, h * s, d * s); dummy.updateMatrix();
+            let id = c.pbCount; c.pBoxes.setMatrixAt(id, dummy.matrix); dummyColor.setHex(colorHex); c.pBoxes.setColorAt(id, dummyColor);
+            c.pbCount++; c.pBoxes.instanceMatrix.needsUpdate = true; c.pBoxes.instanceColor.needsUpdate = true;
+            return { type: 'pBox', id: id, x: x, y: y, z: z, rotY: rotY, sx: w, sy: h, sz: d };
+        }
+
+        function addPropGlowInstance(c, x, y, z, w, h, d, rotY, isAnim) {
+            let s = isAnim ? 0.01 : 1.0; dummy.position.set(x, y, z); dummy.rotation.set(0, rotY, 0); dummy.scale.set(w * s, h * s, d * s); dummy.updateMatrix();
+            let id = c.pgCount; c.pGlows.setMatrixAt(id, dummy.matrix); c.pgCount++; c.pGlows.instanceMatrix.needsUpdate = true;
+            return { type: 'pGlow', id: id, x: x, y: y, z: z, rotY: rotY, sx: w, sy: h, sz: d };
+        }
+
+        function buildLamp(c, cx, cy, cz, yaw, lx, lz, isAnim, parts) {
+            let m = 0x2a2c30; let lToG = (ox, oy, oz) => ({ x: cx + ((lx+ox) * Math.cos(yaw) + (lz+oz) * Math.sin(yaw)), y: cy + oy, z: cz + (-(lx+ox) * Math.sin(yaw) + (lz+oz) * Math.cos(yaw)) });
+            let p1 = lToG(0, 1.5, 0);  parts.push(addPropBoxInstance(c, p1.x, p1.y, p1.z, 0.08, 3.0, 0.08, yaw, m, isAnim));
+            let p2 = lToG(0, 3.0, 0.3); parts.push(addPropBoxInstance(c, p2.x, p2.y, p2.z, 0.12, 0.08, 0.7, yaw, m, isAnim));
+            let p3 = lToG(0, 2.95, 0.45); parts.push(addPropGlowInstance(c, p3.x, p3.y, p3.z, 0.08, 0.04, 0.3, yaw, isAnim));
+        }
+
+        function buildBench(c, cx, cy, cz, yaw, lx, lz, isAnim, parts) {
+            let m = 0x2a2c30; let w = 0x6b4a31; let lToG = (ox, oy, oz) => ({ x: cx + ((lx+ox) * Math.cos(yaw) + (lz+oz) * Math.sin(yaw)), y: cy + oy, z: cz + (-(lx+ox) * Math.sin(yaw) + (lz+oz) * Math.cos(yaw)) });
+            let p1 = lToG(0, 0.25, 0);   parts.push(addPropBoxInstance(c, p1.x, p1.y, p1.z, 1.2, 0.08, 0.5, yaw, w, isAnim));
+            let p2 = lToG(0, 0.55, -0.2); parts.push(addPropBoxInstance(c, p2.x, p2.y, p2.z, 1.2, 0.3, 0.08, yaw, w, isAnim));
+            let p3 = lToG(0.4, 0.15, 0); parts.push(addPropBoxInstance(c, p3.x, p3.y, p3.z, 0.08, 0.3, 0.4, yaw, m, isAnim));
+            let p4 = lToG(-0.4, 0.15, 0); parts.push(addPropBoxInstance(c, p4.x, p4.y, p4.z, 0.08, 0.3, 0.4, yaw, m, isAnim));
+        }
+
+        function buildTrash(c, cx, cy, cz, yaw, lx, lz, isAnim, parts) {
+            let body = 0x3b444d; let lid = 0x232a30;
+            let lToG = (ox, oy, oz) => ({ x: cx + ((lx+ox) * Math.cos(yaw) + (lz+oz) * Math.sin(yaw)), y: cy + oy, z: cz + (-(lx+ox) * Math.sin(yaw) + (lz+oz) * Math.cos(yaw)) });
+            let p1 = lToG(0, 0.45, 0); parts.push(addPropBoxInstance(c, p1.x, p1.y, p1.z, 0.55, 0.9, 0.55, yaw, body, isAnim));
+            let p2 = lToG(0, 0.95, 0); parts.push(addPropBoxInstance(c, p2.x, p2.y, p2.z, 0.62, 0.08, 0.62, yaw, lid, isAnim));
+        }
+
+        const propRegistry = [
+            { id: 'lamp', weight: 0.35, build: buildLamp },
+            { id: 'bench', weight: 0.30, build: buildBench },
+            { id: 'trash', weight: 0.35, build: buildTrash }
+        ];
+
+        function addTrunkInstance(c, x, y, z, h, rotY, colorHex, isAnim) {
+            let s = isAnim ? 0.01 : 1.0; dummy.position.set(x, y, z); dummy.rotation.set(0, rotY, 0); dummy.scale.set(1 * s, h * s, 1 * s); dummy.updateMatrix();
+            let id = c.trCount; c.trunks.setMatrixAt(id, dummy.matrix); dummyColor.setHex(colorHex); c.trunks.setColorAt(id, dummyColor);
+            c.trCount++; c.trunks.instanceMatrix.needsUpdate = true; c.trunks.instanceColor.needsUpdate = true;
+            return { type: 'trunk', id: id, x: x, y: y, z: z, rotY: rotY, sx: 1, sy: h, sz: 1 };
+        }
+
+        function addCrownInstance(c, x, y, z, size, height, rotY, colorHex, isAnim) {
+            let s = isAnim ? 0.01 : 1.0; let sx = size * 1.414, sy = height, sz = size * 1.414;
+            dummy.position.set(x, y, z); dummy.rotation.set(0, rotY, 0); dummy.scale.set(sx * s, sy * s, sz * s); dummy.updateMatrix();
+            let id = c.crCount; c.crowns.setMatrixAt(id, dummy.matrix); dummyColor.setHex(colorHex); c.crowns.setColorAt(id, dummyColor);
+            c.crCount++; c.crowns.instanceMatrix.needsUpdate = true; c.crowns.instanceColor.needsUpdate = true;
+            return { type: 'crown', id: id, x: x, y: y, z: z, rotY: rotY, sx: sx, sy: sy, sz: sz };
+        }
+
+        function addBushInstance(c, x, y, z, sSize, rotY, colorHex, isAnim) {
+            let s = isAnim ? 0.01 : 1.0; dummy.position.set(x, y, z); dummy.rotation.set(0, rotY, 0); dummy.scale.set(sSize * s, sSize * s, sSize * s); dummy.updateMatrix();
+            let id = c.bCount; c.bushes.setMatrixAt(id, dummy.matrix); dummyColor.setHex(colorHex); c.bushes.setColorAt(id, dummyColor);
+            c.bCount++; c.bushes.instanceMatrix.needsUpdate = true; c.bushes.instanceColor.needsUpdate = true;
+            return { type: 'bush', id: id, x: x, y: y, z: z, rotY: rotY, sx: sSize, sy: sSize, sz: sSize };
+        }
+
+        function growNature(c, globalX, globalZ, isAnim, parts, localNoise) {
+            const leafColors = themes[currentTheme].leafColors;
+            const trunkColorHex = themes[currentTheme].trunk;
+            let baseHex = leafColors[Math.floor(hash01(Math.floor(globalX), Math.floor(globalZ), 177) * leafColors.length)];
+            let leafHex = jitterColor(baseHex, 15); let trunkHex = jitterColor(trunkColorHex, 20);
+            let typeBias = getBiomeNoise(globalX + 100, globalZ - 50);
+            let typeRnd = hash01(Math.floor(globalX * 2), Math.floor(globalZ * 2), 903); let isPine = (typeBias > 0.5) ? (typeRnd < 0.7) : (typeRnd < 0.3);
+            let yaw = hash01(Math.floor(globalX * 10), Math.floor(globalZ * 10), 211) * Math.PI;
+
+            if (isPine) {
+                let th = 1.0 + hash01(Math.floor(globalX), Math.floor(globalZ), 77) * 0.8; parts.push(addTrunkInstance(c, globalX, th/2, globalZ, th, yaw, trunkHex, isAnim));
+                let tiers = 2 + Math.floor(hash01(Math.floor(globalX), Math.floor(globalZ), 65) * 2); let currentY = th * 0.6; let cw = 1.2 + hash01(Math.floor(globalX), Math.floor(globalZ), 911) * 0.5;
+                for(let i = 0; i < tiers; i++) {
+                    let ch = 1.5 + hash01(Math.floor(globalX), Math.floor(globalZ), i + 311) * 0.8; parts.push(addCrownInstance(c, globalX, currentY + ch/2, globalZ, cw, ch, yaw, leafHex, isAnim));
+                    currentY += ch * 0.5; cw *= 0.65;
+                }
+            } else if (hash01(Math.floor(globalX), Math.floor(globalZ), 22) > 0.3) {
+                let th = 1.2 + hash01(Math.floor(globalX), Math.floor(globalZ), 44) * 0.8; parts.push(addTrunkInstance(c, globalX, th/2, globalZ, th, yaw, trunkHex, isAnim));
+                let cb = 1.5 + hash01(Math.floor(globalX), Math.floor(globalZ), 55) * 1.0; parts.push(addBushInstance(c, globalX, th + cb/2 - 0.2, globalZ, cb, yaw, leafHex, isAnim));
+                if(hash01(Math.floor(globalX), Math.floor(globalZ), 66) > 0.4) parts.push(addBushInstance(c, globalX + (hash01(Math.floor(globalX), Math.floor(globalZ), 71)-0.5)*0.8, th + cb*0.8, globalZ + (hash01(Math.floor(globalX), Math.floor(globalZ), 72)-0.5)*0.8, cb*0.7, yaw, leafHex, isAnim));
+            }
+        }
+
+        // --- 6. CITY GENERATION ---
+        const CELL_SIZE = 5.0; const NATURE_RING = 14;
+        const DIRS = [{x:1,z:0},{x:-1,z:0},{x:0,z:1},{x:0,z:-1}];
+        let gridMap = new Map(); let roads = []; let populationCount = 0;
+        let sidewalkEdges = new Map();
+        function getEdgeKey(x1, z1, x2, z2) { if (x1 < x2 || (x1 === x2 && z1 < z2)) return `${x1},${z1}_${x2},${z2}`; return `${x2},${z2}_${x1},${z1}`; }
+
+        function clearTileForCity(gx, gz) {
+            let existing = gridMap.get(`${gx},${gz}`);
+            if (existing && (existing === 'H' || existing.startsWith('R') || existing === 'RES')) return false;
+            if (existing && existing.startsWith('N_')) removeGridItem(gx, gz, true);
+            return true;
+        }
+
+        function updateNaturePass() {
+            let cityCells = []; for (let key of gridMap.keys()) { if (!gridMap.get(key).startsWith('N_')) { let p = key.split(',').map(Number); cityCells.push({ x: p[0], z: p[1] }); } }
+            if (cityCells.length === 0) return;
+
+            let needed = new Set();
+            for (let cell of cityCells) {
+                for (let dx = -NATURE_RING; dx <= NATURE_RING; dx++) {
+                    for (let dz = -NATURE_RING; dz <= NATURE_RING; dz++) {
+                        let nx = cell.x + dx; let nz = cell.z + dz; let key = `${nx},${nz}`;
+                        if (gridMap.has(key)) continue;
+
+                        let dist = Math.sqrt(dx*dx + dz*dz); if (dist > NATURE_RING) continue;
+
+                        let noise = getBiomeNoise(nx * CELL_SIZE, nz * CELL_SIZE);
+                        let type = '';
+                        if (noise < 0.30) type = 'N_W';
+                        else if (noise < 0.55) type = 'N_F';
+                        else type = 'N_D';
+
+                        needed.add(`${key}|${type}`);
+                    }
+                }
+            }
+
+            let c = getActiveChunk();
+            for (let entry of needed) {
+                let [key, type] = entry.split('|'); if (gridMap.has(key)) continue;
+                let p = key.split(',').map(Number); let gx = p[0]; let gz = p[1];
+                let cx = gx * CELL_SIZE; let cz = gz * CELL_SIZE; let parts = [];
+
+                if (c.gCount >= HOUSES_PER_CHUNK * 1.7 || c.crCount >= HOUSES_PER_CHUNK * 5.0) c = getActiveChunk();
+                if (c.crCount >= HOUSES_PER_CHUNK * 5.5) c = createChunk();
+
+                if (type === 'N_W') {
+                    let waterColor = jitterColor(themes[currentTheme].water, 14);
+                    parts.push(addWaterInstance(c, cx, -0.05, cz, waterColor));
+                } else if (type === 'N_F') {
+                    let groundColor = jitterColor(themes[currentTheme].forestGround, 14);
+                    parts.push(addGroundInstance(c, cx, 0.01, cz, groundColor, false));
+                    let dense = getBiomeNoise(cx + 200, cz - 200) > 0.5 ? 4 : 2;
+                    for (let i = 0; i < dense; i++) {
+                        let ox = (hash01(gx, gz, 100 + i) - 0.5) * 4.0; let oz = (hash01(gx, gz, 200 + i) - 0.5) * 4.0;
+                        growNature(c, cx + ox, cz + oz, false, parts, 1.0);
+                    }
+                } else {
+                    let groundColor = jitterColor(themes[currentTheme].field, 14);
+                    parts.push(addGroundInstance(c, cx, 0.01, cz, groundColor, false));
+                    if (hash01(gx, gz, 313) < 0.10) growNature(c, cx, cz, false, parts, 0.4);
+                }
+
+                gridMap.set(key, type);
+                emitCellAdded(gx, gz, type);
+                c.instanceToGrid.set(`${gx},${gz}`, parts);
+            }
+        }
+
+        function removeGridItem(gx, gz, silent = false) {
+            let key = `${gx},${gz}`; let cellType = gridMap.get(key);
+            if (!cellType) return;
+            let prevHouseInfo = null;
+
+            // For undo: capture full state BEFORE removal
+            if (!isRestoring && !silent) {
+                if (cellType === 'H') {
+                    // find houseData entry by coords
+                    for (let i = 0; i < houseData.length; i++) {
+                        if (houseData[i] && houseData[i].gx === gx && houseData[i].gz === gz) {
+                            prevHouseInfo = { name: houseData[i].name, lookX: houseData[i].lookX, lookZ: houseData[i].lookZ };
+                            break;
+                        }
+                    }
+                }
+                pushUndo({ kind: 'remove', gx, gz, prevType: cellType, prevHouseInfo });
+            }
+
+            gridMap.delete(key);
+            if (!silent) emitCellRemoved(gx, gz);
+
+            // Remove from roads list if it was a road
+            if (cellType === 'R' || cellType === 'R_MANUAL') {
+                roads = roads.filter(r => !(r.x === gx && r.z === gz));
+            }
+            // Remove from houseData if it was a house
+            if (cellType === 'H') {
+                for (let i = 0; i < houseData.length; i++) {
+                    if (houseData[i] && houseData[i].gx === gx && houseData[i].gz === gz) {
+                        houseData[i] = null; break;
+                    }
+                }
+            }
+            // Remove from action log
+            if (!isRestoring) {
+                actionLog = actionLog.filter(a => !(a.gx === gx && a.gz === gz));
+                scheduleSave();
+            }
+
+            for (let c of chunks) {
+                if (c.instanceToGrid.has(key)) {
+                    let items = c.instanceToGrid.get(key);
+                    dummy.scale.set(0, 0, 0); dummy.updateMatrix();
+                    for (let item of items) {
+                        if (item.type === 'wall') { c.walls.setMatrixAt(item.id, dummy.matrix); c.walls.instanceMatrix.needsUpdate = true; }
+                        else if (item.type === 'roof') { c.roofs.setMatrixAt(item.id, dummy.matrix); c.roofs.instanceMatrix.needsUpdate = true; }
+                        else if (item.type === 'window') { c.windows.setMatrixAt(item.id, dummy.matrix); c.windows.instanceMatrix.needsUpdate = true; }
+                        else if (item.type === 'road') { c.roads.setMatrixAt(item.id, dummy.matrix); c.roads.instanceMatrix.needsUpdate = true; }
+                        else if (item.type === 'trunk') { c.trunks.setMatrixAt(item.id, dummy.matrix); c.trunks.instanceMatrix.needsUpdate = true; }
+                        else if (item.type === 'crown') { c.crowns.setMatrixAt(item.id, dummy.matrix); c.crowns.instanceMatrix.needsUpdate = true; }
+                        else if (item.type === 'bush') { c.bushes.setMatrixAt(item.id, dummy.matrix); c.bushes.instanceMatrix.needsUpdate = true; }
+                        else if (item.type === 'pBox') { c.pBoxes.setMatrixAt(item.id, dummy.matrix); c.pBoxes.instanceMatrix.needsUpdate = true; }
+                        else if (item.type === 'pGlow') { c.pGlows.setMatrixAt(item.id, dummy.matrix); c.pGlows.instanceMatrix.needsUpdate = true; }
+                        else if (item.type === 'ground') { c.grounds.setMatrixAt(item.id, dummy.matrix); c.grounds.instanceMatrix.needsUpdate = true; }
+                        else if (item.type === 'water') {
+                            c.waters.setMatrixAt(item.id, dummy.matrix); c.waters.instanceMatrix.needsUpdate = true;
+                            for (let w = animatedWater.length - 1; w >= 0; w--) {
+                                if (animatedWater[w].chunk === c && animatedWater[w].id === item.id) animatedWater.splice(w, 1);
+                            }
+                        }
+                    }
+                    c.instanceToGrid.delete(key);
+                }
+            }
+
+            for (let d of DIRS) {
+                let nx = gx + d.x; let nz = gz + d.z; let edgeKey = getEdgeKey(gx, gz, nx, nz);
+                if (sidewalkEdges.has(edgeKey)) {
+                    let sw = sidewalkEdges.get(edgeKey);
+                    if (sw.isVisible) {
+                        let swC = chunks[sw.chunkIdx]; dummy.scale.set(0, 0, 0); dummy.updateMatrix();
+                        swC.walls.setMatrixAt(sw.instanceId, dummy.matrix); swC.walls.instanceMatrix.needsUpdate = true; sw.isVisible = false;
+                    }
+                }
+            }
+        }
+
+        function reserveParcel(gx, gz) {
+            if (!clearTileForCity(gx, gz)) return;
+            let c = getActiveChunk(); gridMap.set(`${gx},${gz}`, 'RES');
+            emitCellAdded(gx, gz, 'RES');
+            let id = c.wCount;
+            dummy.position.set(gx * CELL_SIZE, 0.05, gz * CELL_SIZE); dummy.rotation.set(0,0,0); dummy.scale.set(4.8, 0.1, 4.8); dummy.updateMatrix();
+            c.walls.setMatrixAt(id, dummy.matrix); dummyColor.setHex(0xcc4444); c.walls.setColorAt(id, dummyColor);
+            c.wallToHouse[id] = -2; c.wCount++; c.walls.instanceMatrix.needsUpdate = true; c.walls.instanceColor.needsUpdate = true;
+            c.instanceToGrid.set(`${gx},${gz}`, [{ type: 'wall', id: id }]);
+            updateNaturePass();
+
+            if (!isRestoring) {
+                pushUndo({ kind: 'reserve', gx, gz });
+                actionLog.push({ t: 'reserve', gx, gz });
+                scheduleSave();
+            }
+        }
+
+        function buildHouse(gx, gz, lookX, lookZ, isAnim, overrideName) {
+            if (!clearTileForCity(gx, gz)) return false;
+            let c = getActiveChunk(); gridMap.set(`${gx},${gz}`, 'H');
+            emitCellAdded(gx, gz, 'H');
+            let houseId = populationCount; populationCount++;
+
+            const cx = gx * CELL_SIZE; const cz = gz * CELL_SIZE; const yaw = Math.atan2(lookX, lookZ);
+            let localNoise = getBiomeNoise(cx, cz);
+            let styleRnd = hash01(gx, gz, 13); let style = 0;
+            if (localNoise < 0.35) style = styleRnd < 0.7 ? 1 : (styleRnd < 0.85 ? 0 : 2); else if (localNoise > 0.65) style = styleRnd < 0.7 ? 0 : (styleRnd < 0.85 ? 2 : 1); else style = Math.floor(hash01(gx, gz, 14) * 3);
+
+            const theme = themes[currentTheme];
+            let baseColor = theme.houseColors[Math.floor(hash01(gx, gz, 15) * theme.houseColors.length)];
+            const color = jitterColor(baseColor, 12); const roofColor = jitterColor(theme.roof, 8);
+            function localToGlobal(lx, ly, lz) { return { x: cx + (lx * Math.cos(yaw) + lz * Math.sin(yaw)), y: ly, z: cz + (-lx * Math.sin(yaw) + lz * Math.cos(yaw)) }; }
+
+            let parts = []; let wStart = c.wCount; let rStart = c.rCount;
+
+            parts.push(addGroundInstance(c, cx, 0.0, cz, themes[currentTheme].road, isAnim));
+
+            if (style === 0) {
+                let w = 2.0; let d = 2.2; let h = 2.0;
+                let p1 = localToGlobal(0, h/2, 0); parts.push(addBlockInstance(c, p1.x, p1.y, p1.z, w, h, d, yaw, color, isAnim, houseId));
+                let gW = 1.2; let gH = 1.4; let side = hash01(gx, gz, 16) > 0.5 ? 1 : -1;
+                let p2 = localToGlobal((w/2 + gW/2) * side, gH/2, 0.2); parts.push(addBlockInstance(c, p2.x, p2.y, p2.z, gW, gH, d*0.8, yaw, color, isAnim, houseId));
+                let p3 = localToGlobal(0, h + (d*0.4)/2, 0); parts.push(addRoofInstance(c, p3.x, p3.y, p3.z, w*0.9, d*0.6, yaw, roofColor, isAnim, houseId));
+                let pWin = localToGlobal(0, h*0.6, d/2 + 0.02); parts.push(addWindowInstance(c, pWin.x, pWin.y, pWin.z, 0.8, 0.8, yaw, isAnim));
+            } else if (style === 1) {
+                let w = 1.8; let d = 2.0;
+                let p1 = localToGlobal(0, 0.75, 0); parts.push(addBlockInstance(c, p1.x, p1.y, p1.z, w, 1.5, d, yaw, color, isAnim, houseId));
+                let p2 = localToGlobal(0, 2.4, 0.3); parts.push(addBlockInstance(c, p2.x, p2.y, p2.z, w, 1.8, d+0.6, yaw, color, isAnim, houseId));
+                let p3 = localToGlobal(0, 3.8, 0); parts.push(addBlockInstance(c, p3.x, p3.y, p3.z, w*0.9, 1.0, d*0.9, yaw, color, isAnim, houseId));
+                let pWin = localToGlobal(0, 2.4, (d+0.6)/2 + 0.02 + 0.3); parts.push(addWindowInstance(c, pWin.x, pWin.y, pWin.z, 1.0, 0.6, yaw, isAnim));
+            } else {
+                let d = 1.8;
+                let p1 = localToGlobal(-0.4, 1.5, 0); parts.push(addBlockInstance(c, p1.x, p1.y, p1.z, 2.5, 3.0, d, yaw, color, isAnim, houseId));
+                let p2 = localToGlobal(1.0, 0.9, 0.2); parts.push(addBlockInstance(c, p2.x, p2.y, p2.z, 1.6, 1.8, d+0.8, yaw, color, isAnim, houseId));
+                let pWin1 = localToGlobal(-1.0, 1.8, d/2 + 0.02); parts.push(addWindowInstance(c, pWin1.x, pWin1.y, pWin1.z, 0.4, 1.5, yaw, isAnim));
+                let pWin2 = localToGlobal(1.0, 1.0, (d+0.8)/2 + 0.22); parts.push(addWindowInstance(c, pWin2.x, pWin2.y, pWin2.z, 1.0, 0.5, yaw, isAnim));
+            }
+
+            let numPlants = localNoise > 0.6 ? Math.floor(hash01(gx, gz, 17) * 2) + 1 : (localNoise > 0.4 ? (hash01(gx, gz, 18) < 0.5 ? 1 : 0) : (hash01(gx, gz, 19) < 0.15 ? 1 : 0));
+            let corners = [ {x: 1.7, z: 1.2}, {x: -1.7, z: 1.2}, {x: 1.7, z: -1.7}, {x: -1.7, z: -1.7} ];
+            for(let i=0; i < Math.min(numPlants, corners.length); i++) {
+                const cIdx = Math.floor(hash01(gx, gz, 21 + i) * corners.length);
+                const chosen = corners[cIdx];
+                const px = chosen.x + (hash01(gx, gz, 25 + i)-0.5)*0.5;
+                const pz = chosen.z + (hash01(gx, gz, 31 + i)-0.5)*0.5;
+                const p = localToGlobal(px, 0, pz);
+                growNature(c, p.x, p.z, isAnim, parts, localNoise);
+            }
+
+            const propRoll = hash01(gx, gz, 40);
+            if (propRoll < 0.42) {
+                let threshold = 0;
+                const r = hash01(gx, gz, 41);
+                const propX = (hash01(gx, gz, 42) - 0.5) * 3.0; let propZ = 2.3;
+                for (const p of propRegistry) {
+                    threshold += p.weight;
+                    if (r <= threshold) {
+                        p.build(c, cx, 0.06, cz, yaw, propX, propZ, isAnim, parts);
+                        break;
+                    }
+                }
+            }
+
+            const name = overrideName || `Subscriber #${houseId + 1}`;
+            houseData[houseId] = {
+                name: name, chunkIdx: c.idx, colorHex: color, roofHex: roofColor,
+                wStart: wStart, wCount: c.wCount - wStart, rStart: rStart, rCount: c.rCount - rStart,
+                globalX: cx, globalZ: cz, gx: gx, gz: gz, lookX: lookX, lookZ: lookZ
+            };
+            c.houseCount++; c.instanceToGrid.set(`${gx},${gz}`, parts);
+            if (isAnim) activeAnimations.push({ progress: 0, chunk: c, parts: parts, gx: gx, gz: gz });
+
+            if (!isRestoring) {
+                actionLog.push({ t: 'house', gx, gz, lookX, lookZ, name });
+                scheduleSave();
+            }
+            return true;
+        }
+
+        function addRoad(gx, gz, momentumDir = null, isManual = false) {
+            if (!clearTileForCity(gx, gz)) return;
+            let c = getActiveChunk(); gridMap.set(`${gx},${gz}`, isManual ? 'R_MANUAL' : 'R');
+            emitCellAdded(gx, gz, isManual ? 'R_MANUAL' : 'R');
+            roads.push({ x: gx, z: gz, dir: momentumDir, isManual: isManual });
+
+            let parts = []; parts.push(addGroundInstance(c, gx * CELL_SIZE, 0.0, gz * CELL_SIZE, themes[currentTheme].road, false));
+
+            dummy.position.set(gx * CELL_SIZE, 0.02, gz * CELL_SIZE); dummy.rotation.set(-Math.PI / 2, 0, 0); dummy.scale.set(CELL_SIZE, CELL_SIZE, 1);
+            dummy.updateMatrix(); c.roads.setMatrixAt(c.rdCount, dummy.matrix);
+            parts.push({ type: 'road', id: c.rdCount }); c.rdCount++; c.roads.instanceMatrix.needsUpdate = true;
+
+            c.instanceToGrid.set(`${gx},${gz}`, parts);
+
+            for (let d of DIRS) {
+                let nx = gx + d.x; let nz = gz + d.z; let edgeKey = getEdgeKey(gx, gz, nx, nz);
+                if (gridMap.get(`${nx},${nz}`) && gridMap.get(`${nx},${nz}`).startsWith('R')) {
+                    if (sidewalkEdges.has(edgeKey)) {
+                        let sw = sidewalkEdges.get(edgeKey);
+                        if (sw.isVisible) {
+                            let swC = chunks[sw.chunkIdx]; dummy.scale.set(0, 0, 0); dummy.updateMatrix();
+                            swC.walls.setMatrixAt(sw.instanceId, dummy.matrix); swC.walls.instanceMatrix.needsUpdate = true; sw.isVisible = false;
+                        }
+                    }
+                } else {
+                    if (!sidewalkEdges.has(edgeKey)) {
+                        let swC = getActiveChunk(); let cx = gx * CELL_SIZE; let cz = gz * CELL_SIZE;
+                        let ex = cx + d.x * (CELL_SIZE / 2); let ez = cz + d.z * (CELL_SIZE / 2);
+                        let ew = d.x !== 0 ? 0.6 : CELL_SIZE + 0.6; let ed = d.z !== 0 ? 0.6 : CELL_SIZE + 0.6;
+                        let swColor = jitterColor(0x898c91, 5); dummy.position.set(ex, 0.03, ez); dummy.rotation.set(0, 0, 0); dummy.scale.set(ew, 0.06, ed); dummy.updateMatrix();
+                        let id = swC.wCount; swC.walls.setMatrixAt(id, dummy.matrix); dummyColor.setHex(swColor); swC.walls.setColorAt(id, dummyColor);
+                        swC.walls.instanceMatrix.needsUpdate = true; swC.walls.instanceColor.needsUpdate = true;
+                        swC.wallToHouse[id] = -1; swC.wCount++; sidewalkEdges.set(edgeKey, { chunkIdx: swC.idx, instanceId: id, isVisible: true });
+                    }
+                }
+            }
+            if (isManual) updateNaturePass();
+
+            if (!isRestoring) {
+                if (isManual) pushUndo({ kind: 'manualRoad', gx, gz });
+                actionLog.push({ t: 'road', gx, gz, isManual, dx: momentumDir ? momentumDir.x : null, dz: momentumDir ? momentumDir.z : null });
+                scheduleSave();
+            }
+        }
+
+        function spawnSubscriber(isAnim, overrideName) {
+            if (roads.length === 0) { addRoad(0, 0, {x:1, z:0}); }
+            let validLots = []; let validRoadExtensions = []; let protectedRoadHeads = new Set();
+            let autoRoads = roads.filter(r => !r.isManual); if(autoRoads.length === 0) autoRoads = roads;
+
+            for (let r of autoRoads) {
+                for (let d of DIRS) {
+                    let nx = r.x + d.x; let nz = r.z + d.z; let key = `${nx},${nz}`;
+                    if (!gridMap.has(key) || gridMap.get(key).startsWith('N_')) {
+                        let isStraight = (r.dir && r.dir.x === d.x && r.dir.z === d.z);
+                        if (isStraight) protectedRoadHeads.add(key);
+                        let weight = isStraight ? 12 : 1;
+                        for (let i = 0; i < weight; i++) validRoadExtensions.push({ x: nx, z: nz, dir: d });
+                        validLots.push({ x: nx, z: nz, dx: d.x, dz: d.z, key: key });
+                    }
+                }
+            }
+
+            let safeLots = validLots.filter(l => !protectedRoadHeads.has(l.key));
+            let forceIntersection = Math.random() < 0.15;
+            let demandRoad = safeLots.length === 0 || forceIntersection || Math.random() < 0.20;
+
+            if (demandRoad && validRoadExtensions.length > 0) {
+                let ext = forceIntersection ? (validRoadExtensions.filter(e => !protectedRoadHeads.has(`${e.x},${e.z}`))[0] || validRoadExtensions[0]) : validRoadExtensions[Math.floor(Math.random() * validRoadExtensions.length)];
+                addRoad(ext.x, ext.z, ext.dir);
+                let newRoadHeadKey = `${ext.x + ext.dir.x},${ext.z + ext.dir.z}`; let newRoadLots = [];
+                for (let d of DIRS) {
+                    let nx = ext.x + d.x; let nz = ext.z + d.z;
+                    if ((!gridMap.has(`${nx},${nz}`) || gridMap.get(`${nx},${nz}`).startsWith('N_')) && `${nx},${nz}` !== newRoadHeadKey) newRoadLots.push({ x: nx, z: nz, dx: d.x, dz: d.z });
+                }
+                if (newRoadLots.length > 0) { let p = newRoadLots[Math.floor(Math.random() * newRoadLots.length)]; buildHouse(p.x, p.z, -p.dx, -p.dz, isAnim, overrideName); }
+            } else if (safeLots.length > 0) {
+                let p = safeLots[Math.floor(Math.random() * safeLots.length)]; buildHouse(p.x, p.z, -p.dx, -p.dz, isAnim, overrideName);
+            }
+        }
+
+        function simulateSubscribers(count, doAnim) {
+            let i = 0; const batchSize = doAnim ? Math.max(1, Math.floor(count / 60)) : 1000;
+            function addNext() {
+                for(let b=0; b<batchSize; b++) { if (i < count) { spawnSubscriber(doAnim); i++; } }
+                if (i < count) requestAnimationFrame(addNext);
+                else { updateNaturePass(); scheduleSave(); }
+            }
+            addNext();
+        }
+
+        // --- 7. UNDO ---
+        function pushUndo(entry) {
+            undoStack.push(entry);
+            if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+        }
+        function performUndo() {
+            if (undoStack.length === 0) {
+                channel.postMessage({ type: 'TOAST', text: 'Nothing to undo', level: 'info' });
+                return;
+            }
+            let e = undoStack.pop();
+            if (e.kind === 'reserve' || e.kind === 'manualRoad') {
+                // Inverse: remove the cell. Suppress further undo logging for this op.
+                let savedRestoring = isRestoring; isRestoring = true;
+                removeGridItem(e.gx, e.gz);
+                isRestoring = savedRestoring;
+                actionLog = actionLog.filter(a => !(a.gx === e.gx && a.gz === e.gz));
+                scheduleSave();
+                channel.postMessage({ type: 'TOAST', text: `Undid ${e.kind === 'reserve' ? 'reserve' : 'manual road'}`, level: 'info' });
+            } else if (e.kind === 'remove') {
+                // Inverse: restore what was there
+                let savedRestoring = isRestoring; isRestoring = true;
+                if (e.prevType === 'H' && e.prevHouseInfo) {
+                    buildHouse(e.gx, e.gz, e.prevHouseInfo.lookX, e.prevHouseInfo.lookZ, false, e.prevHouseInfo.name);
+                } else if (e.prevType === 'R' || e.prevType === 'R_MANUAL') {
+                    addRoad(e.gx, e.gz, null, e.prevType === 'R_MANUAL');
+                } else if (e.prevType === 'RES') {
+                    reserveParcel(e.gx, e.gz);
+                }
+                isRestoring = savedRestoring;
+                // Re-add to action log
+                if (e.prevType === 'H' && e.prevHouseInfo) {
+                    actionLog.push({ t: 'house', gx: e.gx, gz: e.gz, lookX: e.prevHouseInfo.lookX, lookZ: e.prevHouseInfo.lookZ, name: e.prevHouseInfo.name });
+                } else if (e.prevType === 'R' || e.prevType === 'R_MANUAL') {
+                    actionLog.push({ t: 'road', gx: e.gx, gz: e.gz, isManual: e.prevType === 'R_MANUAL' });
+                } else if (e.prevType === 'RES') {
+                    actionLog.push({ t: 'reserve', gx: e.gx, gz: e.gz });
+                }
+                scheduleSave();
+                channel.postMessage({ type: 'TOAST', text: 'Restored removed cell', level: 'info' });
+            }
+        }
+
+        // --- 8. PERSISTENCE ---
+        function scheduleSave() {
+            if (isRestoring) return;
+            if (saveTimer) clearTimeout(saveTimer);
+            saveTimer = setTimeout(() => { saveNow(); flashSaveIndicator(); }, SAVE_DEBOUNCE_MS);
+        }
+        function saveNow() {
+            try {
+                const data = { version: 1, theme: currentTheme, populationCount, actionLog };
+                localStorage.setItem(SAVE_KEY, JSON.stringify(data));
+            } catch (err) {
+                console.error('Save failed:', err);
+                channel.postMessage({ type: 'TOAST', text: 'Save failed: ' + err.message, level: 'error' });
+            }
+        }
+        function flashSaveIndicator() {
+            const el = document.getElementById('save-indicator');
+            el.classList.add('visible');
+            clearTimeout(window._saveFlashTimer);
+            window._saveFlashTimer = setTimeout(() => el.classList.remove('visible'), 1200);
+        }
+        function resetCity() {
+            // Tear down everything cleanly
+            for (const c of chunks) {
+                scene.remove(c.walls); scene.remove(c.roofs); scene.remove(c.windows); scene.remove(c.roads);
+                scene.remove(c.trunks); scene.remove(c.crowns); scene.remove(c.bushes);
+                scene.remove(c.pBoxes); scene.remove(c.pGlows); scene.remove(c.grounds); scene.remove(c.waters);
+                c.walls.dispose(); c.roofs.dispose(); c.windows.dispose(); c.roads.dispose();
+                c.trunks.dispose(); c.crowns.dispose(); c.bushes.dispose();
+                c.pBoxes.dispose(); c.pGlows.dispose(); c.grounds.dispose(); c.waters.dispose();
+            }
+            chunks = []; houseData = []; activeAnimations = [];
+            animatedWater.length = 0;
+            gridMap = new Map(); roads = []; populationCount = 0;
+            sidewalkEdges = new Map();
+            undoStack = []; actionLog = [];
+            try { localStorage.removeItem(SAVE_KEY); } catch (e) {}
+            // Tell UI to reset its local mirror
+            channel.postMessage({ type: 'MAP_FULL', map: [], pop: 0, chunks: 0 });
+            channel.postMessage({ type: 'TOAST', text: 'City reset', level: 'info' });
+        }
+        function loadFromStorage(notify) {
+            let raw;
+            try { raw = localStorage.getItem(SAVE_KEY); } catch (e) { return false; }
+            if (!raw) { if (notify) channel.postMessage({ type: 'TOAST', text: 'No save found', level: 'warn' }); return false; }
+            let data;
+            try { data = JSON.parse(raw); } catch (e) { if (notify) channel.postMessage({ type: 'TOAST', text: 'Save file corrupted', level: 'error' }); return false; }
+            if (!data || data.version !== 1 || !Array.isArray(data.actionLog)) {
+                if (notify) channel.postMessage({ type: 'TOAST', text: 'Save format unrecognized', level: 'error' });
+                return false;
+            }
+
+            // Wipe current state first (without clearing storage)
+            for (const c of chunks) {
+                scene.remove(c.walls); scene.remove(c.roofs); scene.remove(c.windows); scene.remove(c.roads);
+                scene.remove(c.trunks); scene.remove(c.crowns); scene.remove(c.bushes);
+                scene.remove(c.pBoxes); scene.remove(c.pGlows); scene.remove(c.grounds); scene.remove(c.waters);
+                c.walls.dispose(); c.roofs.dispose(); c.windows.dispose(); c.roads.dispose();
+                c.trunks.dispose(); c.crowns.dispose(); c.bushes.dispose();
+                c.pBoxes.dispose(); c.pGlows.dispose(); c.grounds.dispose(); c.waters.dispose();
+            }
+            chunks = []; houseData = []; activeAnimations = [];
+            animatedWater.length = 0;
+            gridMap = new Map(); roads = []; populationCount = 0;
+            sidewalkEdges = new Map();
+            undoStack = []; actionLog = [];
+
+            if (data.theme && themes[data.theme]) { currentTheme = data.theme; applyTheme(); }
+
+            isRestoring = true;
+            try {
+                // Replay roads first (so sidewalks form correctly), then houses, then reserves
+                const log = data.actionLog;
+                for (const a of log) {
+                    if (a.t === 'road') {
+                        const dir = (a.dx !== null && a.dx !== undefined) ? { x: a.dx, z: a.dz } : null;
+                        addRoad(a.gx, a.gz, dir, !!a.isManual);
+                    }
+                }
+                for (const a of log) {
+                    if (a.t === 'house') buildHouse(a.gx, a.gz, a.lookX, a.lookZ, false, a.name);
+                }
+                for (const a of log) {
+                    if (a.t === 'reserve') reserveParcel(a.gx, a.gz);
+                }
+                actionLog = log.slice();
+                updateNaturePass();
+            } finally {
+                isRestoring = false;
+            }
+            sendFullMap();
+            if (notify) channel.postMessage({ type: 'TOAST', text: `Loaded ${actionLog.filter(a=>a.t==='house').length} houses`, level: 'info' });
+            return true;
+        }
+
+        // --- 9. SEARCH & INPUT ---
+        function searchSubscriber(term) {
+            term = term.toLowerCase().trim(); if (!term) return; let foundId = -1;
+            for (let i = 0; i < houseData.length; i++) { if (houseData[i] && houseData[i].name.toLowerCase().includes(term)) { foundId = i; break; } }
+            if (foundId >= 0) {
+                if (hoveredHouseId >= 0) unhighlight(hoveredHouseId);
+                let hd = houseData[foundId]; trackedHouseId = foundId; hoveredHouseId = foundId;
+                highlight(foundId); tooltip.innerText = hd.name; tooltip.style.opacity = 1;
+                controls.autoRotate = false;
+                targetControlsPos.set(hd.globalX, 0, hd.globalZ); targetCameraPos.set(hd.globalX + 40, 40, hd.globalZ + 40);
+                targetCameraZoom = 4.5; isCameraAnimating = true;
+            } else {
+                channel.postMessage({ type: 'TOAST', text: `No subscriber matches "${term}"`, level: 'warn' });
+            }
+        }
+
+        const tooltip = document.getElementById('tooltip'); let hoveredHouseId = -1; let trackedHouseId = -1;
+        let isCameraAnimating = false; let targetControlsPos = new THREE.Vector3(); let targetCameraPos = new THREE.Vector3(); let targetCameraZoom = 1;
+
+        function highlight(hId) {
+            if(hId < 0 || !houseData[hId]) return; let hd = houseData[hId]; let c = chunks[hd.chunkIdx];
+            for(let i=0; i<hd.wCount; i++) c.walls.setColorAt(hd.wStart + i, highlightColor);
+            for(let i=0; i<hd.rCount; i++) c.roofs.setColorAt(hd.rStart + i, highlightColor);
+            c.walls.instanceColor.needsUpdate = true; c.roofs.instanceColor.needsUpdate = true;
+        }
+
+        function unhighlight(hId) {
+            if(hId < 0 || !houseData[hId]) return; let hd = houseData[hId]; let c = chunks[hd.chunkIdx];
+            dummyColor.setHex(hd.colorHex); for(let i=0; i<hd.wCount; i++) c.walls.setColorAt(hd.wStart + i, dummyColor);
+            dummyColor.setHex(hd.roofHex); for(let i=0; i<hd.rCount; i++) c.roofs.setColorAt(hd.rStart + i, dummyColor);
+            c.walls.instanceColor.needsUpdate = true; c.roofs.instanceColor.needsUpdate = true;
+        }
+
+        const raycaster = new THREE.Raycaster(); const mouse = new THREE.Vector2();
+
+        window.addEventListener('mousemove', (event) => {
+            if (currentTool !== 'none') return;
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1; mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+            if (!window.hoverThrottled) {
+                window.hoverThrottled = true; setTimeout(() => window.hoverThrottled = false, 100);
+                raycaster.setFromCamera(mouse, camera); let targets = []; for(let c of chunks) { targets.push(c.walls); targets.push(c.roofs); }
+                let hits = raycaster.intersectObjects(targets);
+                if(hits.length > 0) {
+                    let hit = hits[0]; let c = chunks[hit.object.userData.chunkIdx];
+                    let houseId = hit.object.userData.isRoof ? c.roofToHouse[hit.instanceId] : c.wallToHouse[hit.instanceId];
+                    if(houseId !== hoveredHouseId && houseId >= 0) {
+                        unhighlight(hoveredHouseId); highlight(houseId); hoveredHouseId = houseId; trackedHouseId = -1;
+                        tooltip.style.opacity = 1; tooltip.innerText = houseData[houseId].name;
+                    }
+                    if (trackedHouseId === -1 && houseId >= 0) { tooltip.style.left = event.clientX + 'px'; tooltip.style.top = event.clientY + 'px'; }
+                } else { if (trackedHouseId === -1) { unhighlight(hoveredHouseId); hoveredHouseId = -1; tooltip.style.opacity = 0; } }
+            }
+        });
+
+        window.addEventListener('mousedown', (event) => {
+            if (currentTool === 'none') return;
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1; mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            let hits = raycaster.intersectObject(plane);
+            if (hits.length > 0) {
+                let gx = Math.round(hits[0].point.x / CELL_SIZE); let gz = Math.round(hits[0].point.z / CELL_SIZE);
+                if (currentTool === 'reserve') reserveParcel(gx, gz);
+                else if (currentTool === 'road') addRoad(gx, gz, null, true);
+                else if (currentTool === 'remove') removeGridItem(gx, gz);
+            }
+        });
+
+        // --- 10. RENDER LOOP ---
+        function animate() {
+            requestAnimationFrame(animate); controls.update();
+            if (isCameraAnimating) {
+                controls.target.lerp(targetControlsPos, 0.05); camera.position.lerp(targetCameraPos, 0.05);
+                camera.zoom += (targetCameraZoom - camera.zoom) * 0.05; camera.updateProjectionMatrix();
+                if (camera.position.distanceTo(targetCameraPos) < 0.5 && Math.abs(camera.zoom - targetCameraZoom) < 0.01) isCameraAnimating = false;
+            }
+
+            if (trackedHouseId >= 0 && houseData[trackedHouseId]) {
+                let vec = new THREE.Vector3(houseData[trackedHouseId].globalX, 10, houseData[trackedHouseId].globalZ); vec.project(camera);
+                tooltip.style.left = ((vec.x * 0.5 + 0.5) * window.innerWidth) + 'px'; tooltip.style.top = ((-vec.y * 0.5 + 0.5) * window.innerHeight) + 'px';
+            }
+
+            if (activeAnimations.length > 0) {
+                let chunksToUpdate = new Set();
+                for (let i = activeAnimations.length - 1; i >= 0; i--) {
+                    let anim = activeAnimations[i]; anim.progress += 0.08;
+                    if (anim.progress >= 1.0) { anim.progress = 1.0; activeAnimations.splice(i, 1); }
+                    let ease = 1 - Math.pow(1 - anim.progress, 3);
+                    for (let part of anim.parts) {
+                        dummy.position.set(part.x, part.y, part.z); dummy.rotation.set(0, part.rotY, 0); dummy.scale.set(part.sx * ease, part.sy * ease, part.sz * ease); dummy.updateMatrix();
+                        if (part.type === 'wall') anim.chunk.walls.setMatrixAt(part.id, dummy.matrix);
+                        else if (part.type === 'roof') anim.chunk.roofs.setMatrixAt(part.id, dummy.matrix);
+                        else if (part.type === 'window') anim.chunk.windows.setMatrixAt(part.id, dummy.matrix);
+                        else if (part.type === 'trunk') anim.chunk.trunks.setMatrixAt(part.id, dummy.matrix);
+                        else if (part.type === 'crown') anim.chunk.crowns.setMatrixAt(part.id, dummy.matrix);
+                        else if (part.type === 'bush') anim.chunk.bushes.setMatrixAt(part.id, dummy.matrix);
+                        else if (part.type === 'pBox') anim.chunk.pBoxes.setMatrixAt(part.id, dummy.matrix);
+                        else if (part.type === 'pGlow') anim.chunk.pGlows.setMatrixAt(part.id, dummy.matrix);
+                        else if (part.type === 'ground') anim.chunk.grounds.setMatrixAt(part.id, dummy.matrix);
+                    }
+                    chunksToUpdate.add(anim.chunk);
+                }
+                for (let c of chunksToUpdate) {
+                    c.walls.instanceMatrix.needsUpdate = true; c.roofs.instanceMatrix.needsUpdate = true; c.windows.instanceMatrix.needsUpdate = true;
+                    c.trunks.instanceMatrix.needsUpdate = true; c.crowns.instanceMatrix.needsUpdate = true; c.bushes.instanceMatrix.needsUpdate = true;
+                    c.pBoxes.instanceMatrix.needsUpdate = true; c.pGlows.instanceMatrix.needsUpdate = true; c.grounds.instanceMatrix.needsUpdate = true;
+                }
+            }
+
+            if (animatedWater.length > 0) {
+                const t = performance.now() * 0.001;
+                const waterChunks = new Set();
+                for (const w of animatedWater) {
+                    dummy.position.set(w.x, w.baseY + Math.sin(t * 1.6 + w.phase) * 0.04, w.z);
+                    dummy.rotation.set(0, 0, 0);
+                    const stretch = 1.0 + Math.sin(t * 1.2 + w.phase) * 0.03;
+                    dummy.scale.set(stretch, 1.0, stretch);
+                    dummy.updateMatrix();
+                    w.chunk.waters.setMatrixAt(w.id, dummy.matrix);
+                    waterChunks.add(w.chunk);
+                }
+                for (const c of waterChunks) c.waters.instanceMatrix.needsUpdate = true;
+            }
+            renderer.render(scene, camera);
+        }
+
+        function applyTheme() {
+            const t = themes[currentTheme];
+            scene.background.setHex(t.bg);
+            scene.fog.color.setHex(t.fog);
+            plane.material.color.setHex(t.ocean);
+            waterMat.color.setHex(t.water);
+            roadMat.map = makeNoiseTexture(t.road, 18);
+            roadMat.needsUpdate = true;
+        }
+
+        // --- 11. BOOT ---
+        const loaded = loadFromStorage(false);
+        if (!loaded) {
+            updateNaturePass();
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            const aspect = window.innerWidth / window.innerHeight; camera.left = -d * aspect; camera.right = d * aspect;
+            camera.top = d; camera.bottom = -d; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Save before unload as a final safety
+        window.addEventListener('beforeunload', () => { saveNow(); });
+    </script>
+</body>
+</html>
